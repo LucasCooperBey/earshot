@@ -1,0 +1,19 @@
+# earshot config — copy to ~/.config/earshot/config and edit. Everything here is optional.
+
+# EARSHOT_SOURCE=claude-code       # claude-code | clipboard | stdin | file
+# EARSHOT_SPEED=1.5                # 1.0 = normal speech; 2.0 = power skimming
+# EARSHOT_VOICE=                   # system-voice name (macOS: list with `say -v '?'`)
+
+# --- summarizer (any ollama-compatible server) ---
+# LLM_MODEL=llama3.2:3b            # gemma3:4b is a touch sharper, ~3.3GB
+# LLM_URL=http://localhost:11434   # or your own box: http://192.168.1.50:11434
+# LLM_KEEPALIVE=30m                # keep the model warm between calls
+
+# --- nicer voice than the system one (optional) ---
+# Run an OpenAI-compatible TTS server such as kokoro-fastapi, then:
+# TTS_URL=http://localhost:8880    # empty => built-in system voice (zero setup)
+# TTS_VOICE=af_nova
+# TTS_MODEL=kokoro
+
+# MAX_CHARS=24000                  # cap the distiller's input (keeps the tail)
+# EARSHOT_HOME=                    # set automatically by install.sh

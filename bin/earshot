@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# earshot — hear the action-first TL;DR of your AI coding agent's last reply. Fully local. MIT.
+#
+#   earshot              summarize + speak the agent's last response (action-first)
+#   earshot say [text]   speak text / stdin / clipboard verbatim
+#   earshot --warm       preload the distill model (kills cold-start)
+#   earshot --stop       stop playback
+#   earshot --dry        show what would happen, no audio
+#   earshot help
+set -u
+
+CONFIG="${EARSHOT_CONFIG:-$HOME/.config/earshot/config}"
+[ -f "$CONFIG" ] && . "$CONFIG"
+HERE="${EARSHOT_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+STATE="${EARSHOT_STATE:-$HOME/.local/state/earshot}"; mkdir -p "$STATE"
+LOG="$STATE/earshot.log"
+PIDF="$STATE/play.pid"
+OS="$(uname -s)"
+
+: "${EARSHOT_SOURCE:=claude-code}"      # claude-code | clipboard | stdin | file
+: "${EARSHOT_VOICE:=}"                  # system-TTS voice name (optional)
+: "${EARSHOT_SPEED:=1.5}"              # 1.0 = normal; the whole point is brisk skimming-by-ear
+: "${LLM_URL:=http://localhost:11434}" # ollama-compatible endpoint (local, or your own box)
+: "${LLM_MODEL:=llama3.2:3b}"
+: "${LLM_KEEPALIVE:=30m}"
+: "${TTS_URL:=}"                        # empty => system voice; e.g. http://localhost:8880 (kokoro-fastapi)
+: "${TTS_MODEL:=kokoro}"
+: "${TTS_VOICE:=af_nova}"
+: "${MAX_CHARS:=24000}"
+: "${PROMPT_FILE:=$HERE/prompts/summary.txt}"
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" >>"$LOG" 2>/dev/null; }
+die(){ printf 'earshot: %s\n' "$*" >&2; exit 1; }
+
+stop_play(){
+  if [ -f "$PIDF" ]; then p="$(cat "$PIDF" 2>/dev/null || true)"; [ -n "${p:-}" ] && { kill "$p" 2>/dev/null||true; pkill -P "$p" 2>/dev/null||true; }; rm -f "$PIDF"; fi
+  for x in ffplay afplay aplay paplay mpg123 say spd-say espeak-ng; do pkill -x "$x" 2>/dev/null||true; done
+}
+
+clipboard(){
+  case "$OS" in
+    Darwin) pbpaste 2>/dev/null ;;
+    *) { have wl-paste && wl-paste 2>/dev/null; } || { have xclip && xclip -selection clipboard -o 2>/dev/null; } || { have xsel && xsel -b 2>/dev/null; } ;;
+  esac
+}
+
+get_last_response(){
+  case "$EARSHOT_SOURCE" in
+    clipboard) clipboard ;;
+    stdin) cat ;;
+    file) cat "${EARSHOT_FILE:?set EARSHOT_FILE for source=file}" ;;
+    *) python3 "$HERE/lib/extract_last_response.py" 2>>"$LOG" ;;  # claude-code (default)
+  esac
+}
+
+distill(){   # raw text on stdin -> action-first briefing on stdout (raw passthrough on failure)
+  local raw prompt full body out
+  raw="$(cat)"; [ -z "$raw" ] && return 0
+  if [ "${#raw}" -gt "$MAX_CHARS" ]; then raw="(earlier text trimmed)
+$(printf '%s' "$raw" | tail -c "$MAX_CHARS")"; fi
+  prompt="$(cat "$PROMPT_FILE" 2>/dev/null)"
+  if [ -z "$prompt" ] || ! have jq || ! have curl; then printf '%s' "$raw"; return 0; fi
+  full="$prompt"$'\n\n---- ASSISTANT MESSAGE TO BRIEF ----\n'"$raw"
+  body="$(mktemp)"
+  jq -nc --arg m "$LLM_MODEL" --arg p "$full" --arg ka "$LLM_KEEPALIVE" \
+     '{model:$m,prompt:$p,stream:false,keep_alive:$ka,options:{temperature:0.2}}' >"$body"
+  out="$(curl -s -m180 "$LLM_URL/api/generate" -d @"$body" 2>>"$LOG" | jq -r '.response // empty' 2>/dev/null)"
+  rm -f "$body"
+  [ -z "$out" ] && out="$raw"
+  out="$(printf '%s' "$out" | perl -0777 -pe 's/<think>.*?<\/think>//gs' 2>/dev/null || printf '%s' "$out")"
+  printf '%s' "$out" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+speak_system(){   # $1 text
+  local rate; rate="$(awk "BEGIN{print int(175*${EARSHOT_SPEED})}" 2>/dev/null || echo 175)"
+  case "$OS" in
+    Darwin) nohup say ${EARSHOT_VOICE:+-v "$EARSHOT_VOICE"} -r "$rate" -- "$1" >/dev/null 2>&1 & ;;
+    *) if have espeak-ng; then nohup espeak-ng -s "$rate" -- "$1" >/dev/null 2>&1 &
+       elif have spd-say; then nohup spd-say -w -- "$1" >/dev/null 2>&1 &
+       else die "no system TTS found (install espeak-ng, or set TTS_URL to a TTS server)"; fi ;;
+  esac
+  echo $! >"$PIDF"; disown 2>/dev/null || true
+}
+
+speak_openai(){   # $1 text  -> POST to an OpenAI-compatible /v1/audio/speech, play the stream
+  have ffplay || die "TTS_URL set but ffplay missing (install ffmpeg), or unset TTS_URL for the system voice"
+  have jq || die "TTS_URL set but jq missing"
+  local body; body="$(mktemp)"
+  jq -nc --arg i "$1" --arg m "$TTS_MODEL" --arg v "$TTS_VOICE" --argjson sp "$EARSHOT_SPEED" \
+     '{model:$m,input:$i,voice:$v,speed:$sp,response_format:"wav"}' >"$body"
+  nohup bash -c "curl -s -N -X POST '$TTS_URL/v1/audio/speech' -H content-type:application/json -d @'$body' | ffplay -nodisp -autoexit -loglevel quiet -i pipe:0; rm -f '$body'" >/dev/null 2>&1 &
+  echo $! >"$PIDF"; disown 2>/dev/null || true
+}
+
+speak(){ if [ -n "$TTS_URL" ]; then speak_openai "$1"; else speak_system "$1"; fi; }
+
+usage(){ sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-summary}"
+case "$cmd" in
+  -h|help|--help) usage; exit 0 ;;
+  --stop) stop_play; echo "stopped"; exit 0 ;;
+  --warm)
+    have jq && have curl || die "need jq + curl to warm the model"
+    b="$(mktemp)"; jq -nc --arg m "$LLM_MODEL" --arg ka "$LLM_KEEPALIVE" '{model:$m,prompt:"ok",stream:false,keep_alive:$ka}' >"$b"
+    ( curl -s -m120 "$LLM_URL/api/generate" -d @"$b" >/dev/null 2>&1; rm -f "$b" ) &
+    echo "warming $LLM_MODEL at $LLM_URL"; exit 0 ;;
+  --dry)
+    raw="$(get_last_response)"
+    echo "dry: source=$EARSHOT_SOURCE chars=${#raw} llm=$LLM_MODEL@$LLM_URL tts=$([ -n "$TTS_URL" ] && echo "$TTS_URL" || echo system) speed=${EARSHOT_SPEED}x"
+    exit 0 ;;
+  say)
+    shift
+    if [ "$#" -gt 0 ]; then text="$*"; elif [ ! -t 0 ]; then text="$(cat)"; else text="$(clipboard)"; fi
+    text="$(printf '%s' "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$text" ] && { echo "earshot: nothing to say"; exit 0; }
+    stop_play; speak "$text"; echo "speaking (${#text} chars)"; exit 0 ;;
+  summary|*)
+    raw="$(get_last_response)"
+    [ -z "$raw" ] && { stop_play; speak "Nothing to summarize yet."; echo "nothing to summarize"; exit 0; }
+    out="$(printf '%s' "$raw" | distill)"
+    stop_play; speak "$out"; echo "speaking summary (${#out} chars)"; exit 0 ;;
+esac
