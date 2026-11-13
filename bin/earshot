@@ -35,7 +35,6 @@ die(){ printf 'earshot: %s\n' "$*" >&2; exit 1; }
 
 stop_play(){
   if [ -f "$PIDF" ]; then p="$(cat "$PIDF" 2>/dev/null || true)"; [ -n "${p:-}" ] && { kill "$p" 2>/dev/null||true; pkill -P "$p" 2>/dev/null||true; }; rm -f "$PIDF"; fi
-  for x in ffplay afplay aplay paplay mpg123 say spd-say espeak-ng; do pkill -x "$x" 2>/dev/null||true; done
 }
 
 clipboard(){
@@ -54,20 +53,29 @@ get_last_response(){
   esac
 }
 
+no_summary(){   # model gave nothing: keep the reply, and say so on stderr and in the log
+  local msg
+  msg="earshot: no summary from ${LLM_MODEL} at ${LLM_URL}; speaking the reply as is"
+  printf '%s\n' "$msg" >&2
+  printf '%s\n' "$msg" >>"$LOG" 2>/dev/null || true
+  : >"$STATE/no-summary"   # distill runs in a subshell, so the summary branch reads this file
+}
+
 distill(){   # raw text on stdin -> action-first briefing on stdout (raw passthrough on failure)
   local raw prompt full body out
   raw="$(cat)"; [ -z "$raw" ] && return 0
+  rm -f "$STATE/no-summary"
   if [ "${#raw}" -gt "$MAX_CHARS" ]; then raw="(earlier text trimmed)
 $(printf '%s' "$raw" | tail -c "$MAX_CHARS")"; fi
   prompt="$(cat "$PROMPT_FILE" 2>/dev/null)"
-  if [ -z "$prompt" ] || ! have jq || ! have curl; then printf '%s' "$raw"; return 0; fi
+  if [ -z "$prompt" ] || ! have jq || ! have curl; then no_summary; printf '%s' "$raw"; return 0; fi
   full="$prompt"$'\n\n---- ASSISTANT MESSAGE TO BRIEF ----\n'"$raw"
   body="$(mktemp)"
   jq -nc --arg m "$LLM_MODEL" --arg p "$full" --arg ka "$LLM_KEEPALIVE" \
-     '{model:$m,prompt:$p,stream:false,keep_alive:$ka,options:{temperature:0.2}}' >"$body"
+     '{model:$m,prompt:$p,stream:false,think:false,keep_alive:$ka,options:{temperature:0.2}}' >"$body"
   out="$(curl -s -m180 "$LLM_URL/api/generate" -d @"$body" 2>>"$LOG" | jq -r '.response // empty' 2>/dev/null)"
   rm -f "$body"
-  [ -z "$out" ] && out="$raw"
+  if [ -z "$out" ]; then no_summary; out="$raw"; fi
   out="$(printf '%s' "$out" | perl -0777 -pe 's/<think>.*?<\/think>//gs' 2>/dev/null || printf '%s' "$out")"
   printf '%s' "$out" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
@@ -120,5 +128,7 @@ case "$cmd" in
     raw="$(get_last_response)"
     [ -z "$raw" ] && { stop_play; speak "Nothing to summarize yet."; echo "nothing to summarize"; exit 0; }
     out="$(printf '%s' "$raw" | distill)"
-    stop_play; speak "$out"; echo "speaking summary (${#out} chars)"; exit 0 ;;
+    stop_play; speak "$out"
+    if [ -f "$STATE/no-summary" ]; then echo "speaking reply as is (${#out} chars)"; else echo "speaking summary (${#out} chars)"; fi
+    exit 0 ;;
 esac
